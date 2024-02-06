@@ -72,13 +72,13 @@ class GroupChat:
     speaker_transitions_type: Optional[str] = None
     enable_clear_history: Optional[bool] = False
 
-    pre_prompt = """
+    pre_prompt: str = """
 You are in a role play game. The following roles are available:
 {roles}
 Read the following conversation.
 Then select the next role from {names} to play. Only return the role.
     """.strip(" \n\r\t")
-    post_prompt = """
+    post_prompt: str = """
 Read the above conversation, then select the next role from {names} to talk. Before selecting the role,
 make sure to write your thoughts on why you are making certain decision, and then, at the very end,
 output exactly one role from the given list. Selected role must be between <next> and </next> tags.
