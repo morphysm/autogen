@@ -2,8 +2,9 @@ import logging
 import random
 import re
 import sys
+from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Union, Tuple, Callable
 
 
 from ..code_utils import content_str
@@ -70,6 +71,18 @@ class GroupChat:
     allowed_or_disallowed_speaker_transitions: Optional[Dict] = None
     speaker_transitions_type: Optional[str] = None
     enable_clear_history: Optional[bool] = False
+
+    pre_prompt = """
+You are in a role play game. The following roles are available:
+{roles}
+Read the following conversation.
+Then select the next role from {names} to play. Only return the role.
+    """.strip(" \n\r\t")
+    post_prompt = """
+Read the above conversation, then select the next role from {names} to talk. Before selecting the role,
+make sure to write your thoughts on why you are making certain decision, and then, at the very end,
+output exactly one role from the given list. Selected role must be between <next> and </next> tags.
+    """.strip(" \n\r\t")
 
     _VALID_SPEAKER_SELECTION_METHODS = ["auto", "manual", "random", "round_robin"]
     _VALID_SPEAKER_TRANSITIONS_TYPE = ["allowed", "disallowed", None]
@@ -199,17 +212,13 @@ class GroupChat:
         """Return the system message for selecting the next speaker. This is always the *first* message in the context."""
         if agents is None:
             agents = self.agents
-        return f"""You are in a role play game. The following roles are available:
-{self._participant_roles(agents)}.
-
-Read the following conversation.
-Then select the next role from {[agent.name for agent in agents]} to play. Only return the role."""
+        return self.pre_prompt.format(roles=self._participant_roles(agents), names=[agent.name for agent in agents])
 
     def select_speaker_prompt(self, agents: Optional[List[Agent]] = None) -> str:
         """Return the floating system prompt selecting the next speaker. This is always the *last* message in the context."""
         if agents is None:
             agents = self.agents
-        return f"Read the above conversation. Then select the next role from {[agent.name for agent in agents]} to play. Only return the role."
+        return self.post_prompt.format(names=[agent.name for agent in agents])
 
     def manual_select_speaker(self, agents: Optional[List[Agent]] = None) -> Union[Agent, None]:
         """Manually select the next speaker."""
@@ -245,6 +254,43 @@ Then select the next role from {[agent.name for agent in agents]} to play. Only 
         if agents is None:
             agents = self.agents
         return random.choice(agents)
+
+    def detect_direct_mention(self):
+        if not self.messages:
+            return
+
+        text = self.messages[-1].get("content")
+        if not text or not isinstance(text, str):
+            return
+
+        maybe_tag, *_ = text.strip("\n\r\t ").split(" ")
+        if not maybe_tag.startswith("@"):
+            return
+
+        maybe_name = maybe_tag.strip("@").lower()
+        for name in self.agent_names:
+            # We are doing case-insensitive 'prefix' matching here, because this will both accomodate for
+            # full matches AND cases where someone just entered part of the name (for example, @NISI or @nisi
+            # instead of @NISI_Engineer etc).
+            if name.lower().startswith(maybe_name):
+                try:
+                    return self.agent_by_name(name)
+                except ValueError:
+                    return
+
+    def _prepare_chat_state_summary(self):
+        if not self.messages:
+            return "Current chat state: nobody spoke yet."
+
+        if self.messages[-1]["role"] == "function":
+            if len(self.messages) > 1:
+                if name := self.messages[-2].get("name"):
+                    return f"Current chat state: '{name}' called function, but didn't speak yet."
+            return "Current chat state: some agent called function, but didn't speak yet."
+
+        if name := self.messages[-1].get("name"):
+            return f"Current chat state: '{name}' spoke last."
+        return "Current chat state: conversation is ongoing."  # @TODO: This is at best neutral, at worst misleading.
 
     def _prepare_and_select_agents(
         self, last_speaker: Agent
@@ -305,6 +351,11 @@ Then select the next role from {[agent.name for agent in agents]} to play. Only 
                         f"No agent can execute the function {', '.join(funcs)}. "
                         "Please check the function_map of the agents."
                     )
+
+        tagged_agent = self.detect_direct_mention()
+        if tagged_agent:
+            tagged_agent, None, None
+
         # remove the last speaker from the list to avoid selecting the same speaker if allow_repeat_speaker is False
         agents = [agent for agent in agents if agent != last_speaker] if allow_repeat_speaker is False else agents
 
@@ -350,7 +401,11 @@ Then select the next role from {[agent.name for agent in agents]} to play. Only 
                 select_speaker_messages[-1] = dict(select_speaker_messages[-1], function_call=None)
             if select_speaker_messages[-1].get("tool_calls", False):
                 select_speaker_messages[-1] = dict(select_speaker_messages[-1], tool_calls=None)
+
+            chat_state_summary = self._prepare_chat_state_summary()
+            logger.info("Inserted summary in groupchat: '%s'", chat_state_summary)
             select_speaker_messages = select_speaker_messages + [
+                {"role": "system", "content": chat_state_summary},
                 {"role": "system", "content": self.select_speaker_prompt(graph_eligible_agents)}
             ]
         return selected_agent, graph_eligible_agents, select_speaker_messages
@@ -359,20 +414,36 @@ Then select the next role from {[agent.name for agent in agents]} to play. Only 
         """Select the next speaker."""
         selected_agent, agents, messages = self._prepare_and_select_agents(last_speaker)
         if selected_agent:
+            logger.info("Shortcut decision, next speaker is assigned: '%s'", selected_agent.name)
             return selected_agent
+
         # auto speaker selection
         selector.update_system_message(self.select_speaker_msg(agents))
         final, name = selector.generate_oai_reply(messages)
+        logger.info("Making a next turn decision: %s\n%s\n%s", name, "=" * 50, "=" * 50)
+
+        # Parse response.
+        if parsed := BeautifulSoup(name, "html.parser").find("next"):
+            name = parsed.text
+
         return self._finalize_speaker(last_speaker, final, name, agents)
 
     async def a_select_speaker(self, last_speaker: Agent, selector: ConversableAgent) -> Agent:
         """Select the next speaker."""
         selected_agent, agents, messages = self._prepare_and_select_agents(last_speaker)
         if selected_agent:
+            logger.info("Shortcut decision, next speaker is assigned: '%s'", selected_agent.name)
             return selected_agent
+
         # auto speaker selection
         selector.update_system_message(self.select_speaker_msg(agents))
         final, name = await selector.a_generate_oai_reply(messages)
+        logger.info("Making a next turn decision: %s\n%s\n%s", name, "=" * 50, "=" * 50)
+
+        # Parse response.
+        if parsed := BeautifulSoup(name, "html.parser").find("next"):
+            name = parsed.text
+
         return self._finalize_speaker(last_speaker, final, name, agents)
 
     def _finalize_speaker(self, last_speaker: Agent, final: bool, name: str, agents: Optional[List[Agent]]) -> Agent:
@@ -449,6 +520,8 @@ class GroupChatManager(ConversableAgent):
         max_consecutive_auto_reply: Optional[int] = sys.maxsize,
         human_input_mode: Optional[str] = "NEVER",
         system_message: Optional[Union[str, List]] = "Group chat manager.",
+        before_generation_handler: Optional[Callable[[Agent], None]] = None,
+        new_message_handler: Optional[Callable[[dict], None]] = None,
         **kwargs,
     ):
         if kwargs.get("llm_config") and (kwargs["llm_config"].get("functions") or kwargs["llm_config"].get("tools")):
@@ -465,6 +538,9 @@ class GroupChatManager(ConversableAgent):
         )
         # Store groupchat
         self._groupchat = groupchat
+
+        self.before_generation_handler = before_generation_handler
+        self.new_message_handler = new_message_handler
 
         # Order of register_reply is important.
         # Allow sync chat if initiated using initiate_chat
@@ -516,6 +592,12 @@ class GroupChatManager(ConversableAgent):
             try:
                 # select the next speaker
                 speaker = groupchat.select_speaker(speaker, self)
+                if self.before_generation_handler:
+                    try:
+                        self.before_generation_handler(speaker)
+                    except Exception as e:
+                        logger.exception(e)
+
                 # let the speaker speak
                 reply = speaker.generate_reply(sender=self)
             except KeyboardInterrupt:
@@ -545,6 +627,13 @@ class GroupChatManager(ConversableAgent):
             # The speaker sends the message without requesting a reply
             speaker.send(reply, self, request_reply=False)
             message = self.last_message(speaker)
+            if self.new_message_handler:
+                try:
+                    export_message = {**message, "name": speaker.name if message["role"] != "function" else "system"}
+                    self.new_message_handler(export_message)
+                except Exception as e:
+                    logger.exception(e)
+
         if self.client_cache is not None:
             for a in groupchat.agents:
                 a.client_cache = a.previous_cache
@@ -584,6 +673,12 @@ class GroupChatManager(ConversableAgent):
             try:
                 # select the next speaker
                 speaker = await groupchat.a_select_speaker(speaker, self)
+                if self.before_generation_handler:
+                    try:
+                        self.before_generation_handler(speaker)
+                    except Exception as e:
+                        logger.exception(e)
+
                 # let the speaker speak
                 reply = await speaker.a_generate_reply(sender=self)
             except KeyboardInterrupt:
@@ -600,6 +695,13 @@ class GroupChatManager(ConversableAgent):
             # The speaker sends the message without requesting a reply
             await speaker.a_send(reply, self, request_reply=False)
             message = self.last_message(speaker)
+            if self.new_message_handler:
+                try:
+                    export_message = {**message, "name": speaker.name if message["role"] != "function" else "system"}
+                    self.new_message_handler(export_message)
+                except Exception as e:
+                    logger.exception(e)
+
         if self.client_cache is not None:
             for a in groupchat.agents:
                 a.client_cache = a.previous_cache
