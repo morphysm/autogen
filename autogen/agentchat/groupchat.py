@@ -354,7 +354,7 @@ output exactly one role from the given list. Selected role must be between <next
 
         tagged_agent = self.detect_direct_mention()
         if tagged_agent:
-            tagged_agent, None, None
+            return tagged_agent, None, None
 
         # remove the last speaker from the list to avoid selecting the same speaker if allow_repeat_speaker is False
         agents = [agent for agent in agents if agent != last_speaker] if allow_repeat_speaker is False else agents
