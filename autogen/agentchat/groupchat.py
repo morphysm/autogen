@@ -675,7 +675,7 @@ class GroupChatManager(ConversableAgent):
                 speaker = await groupchat.a_select_speaker(speaker, self)
                 if self.before_generation_handler:
                     try:
-                        self.before_generation_handler(speaker)
+                        await self.before_generation_handler(speaker)
                     except Exception as e:
                         logger.exception(e)
 
@@ -698,7 +698,7 @@ class GroupChatManager(ConversableAgent):
             if self.new_message_handler:
                 try:
                     export_message = {**message, "name": speaker.name if message["role"] != "function" else "system"}
-                    self.new_message_handler(export_message)
+                    await self.new_message_handler(export_message)
                 except Exception as e:
                     logger.exception(e)
 
